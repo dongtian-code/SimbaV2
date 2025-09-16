@@ -1,0 +1,24 @@
+# configs/online.yaml
+defaults:
+  - _self_
+  - override hydra/sweeper: list  # use the zipped-list sweeper plugin
+
+runner: online
+
+# Your experiment knobs (rename to what your code expects)
+seed: 0
+task: halfcheetah-run
+algo:
+  utd: 1
+model:
+  width: 1024
+  layers: 4
+train:
+  steps: 1000000
+
+hydra:
+  run:
+    dir: outputs/${hydra.job.name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweeper:
+    grid_params: {}   # cartesian product part
+    list_params: {}   # zipped part (fill below for sweeps)
