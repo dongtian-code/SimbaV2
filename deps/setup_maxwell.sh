@@ -40,19 +40,24 @@ init_conda() {
     fi
 }
 
-# Clone (or update) a git dependency next to the repo and pip install -e it.
-# Editable installs keep the source readable on the cluster, which matters when
-# a job's traceback points into cw2 or MetaWorld.
-clone_or_update_repo() {
+# Reuse an existing shared checkout, or clone it if absent, then pip install -e it.
+#
+# Deliberately NON-DESTRUCTIVE: an existing checkout is installed at whatever
+# commit it is already on, with no fetch/checkout/pull. $DEPS_DIR is shared with
+# the sibling dt_rl and RLAC repos, their editable installs resolve to this
+# original path (not to cw2's code copy), and their jobs re-import from it on
+# every requeue. Moving this checkout would change the code under experiments
+# that are currently running. Update it by hand, deliberately, when no jobs
+# depend on it.
+clone_or_reuse_repo() {
     local name="$1" url="$2" branch="$3" target="$DEPS_DIR/$name"
     mkdir -p "$DEPS_DIR"
     if [[ -d "$target/.git" ]]; then
-        log "Updating $name in $target."
-        run git -C "$target" fetch --all --prune
-        run git -C "$target" checkout "$branch"
-        run git -C "$target" pull --ff-only || log "Could not fast-forward $name; leaving it as is."
+        log "Reusing the existing $name checkout at $target (NOT updating it)."
+        run git -C "$target" log --oneline -1
+        run git -C "$target" status --short --branch | head -1
     else
-        log "Cloning $name into $target."
+        log "Cloning $name into $target at branch $branch."
         run git clone --branch "$branch" "$url" "$target"
     fi
     run python -m pip install -e "$target"
@@ -85,8 +90,19 @@ else
 fi
 
 log "Installing git dependencies."
-clone_or_update_repo "cw2"       "git@github.com:DongTian95/cw2.git"          "dt_branch"
-clone_or_update_repo "Metaworld" "git@github.com:dongtian-code/Metaworld.git" "dt_branch"
+clone_or_reuse_repo "cw2" "git@github.com:DongTian95/cw2.git" "dt_branch"
+
+# MetaWorld is installed NON-editable, straight into this env's site-packages,
+# rather than shared through $DEPS_DIR. The shared checkout is pinned to
+# MetaWorld 2.x because dt_rl's fancy_gym requires it (2.x also pins
+# mujoco<3.0.0); this repo needs 3.x, whose "-v3" tasks run the v2 reward
+# function by default. Both cannot be one editable checkout, so keep them apart.
+log "Installing MetaWorld 3.x into this environment only (not into $DEPS_DIR)."
+run python -m pip install --no-cache-dir "git+https://github.com/dongtian-code/Metaworld.git@dt_branch"
+
+# MetaWorld 2.x, if it was ever installed here, pins mujoco<3.0.0 and drags the
+# whole env back to 2.3.x. Re-assert the pin after the MetaWorld install.
+run python -m pip install "mujoco==3.3.1"
 
 log "Installing this repo (scale_rl) in editable mode."
 # --no-deps: setup.py reads deps/requirements.txt, which pins the paper's
@@ -105,9 +121,21 @@ for name in mods:
 import jax
 print("  jax devices:", jax.devices())
 
-from scale_rl.envs.metaworld import metaworld_task_name, METAWORLD_MT50
-print("  metaworld tasks in grid:", len(METAWORLD_MT50),
-      "->", metaworld_task_name(METAWORLD_MT50[0]))
+import metaworld, mujoco
+assert hasattr(metaworld, "ALL_V3_ENVIRONMENTS"), (
+    f"metaworld {metaworld.__version__} at {metaworld.__file__} is 2.x; this repo needs 3.x"
+)
+assert int(mujoco.__version__.split(".")[0]) >= 3, (
+    f"mujoco {mujoco.__version__} is too old for MetaWorld 3.x (a metaworld 2.x "
+    "install pins mujoco<3.0.0 and will have downgraded it)"
+)
+
+from scale_rl.envs.metaworld import make_metaworld_env, METAWORLD_MT50
+print("  metaworld tasks in grid:", len(METAWORLD_MT50))
+env = make_metaworld_env(METAWORLD_MT50[0], seed=0)
+obs, info = env.reset()
+print("  probe:", METAWORLD_MT50[0], "obs", obs.shape,
+      "act", env.action_space.shape, "success in info:", "success" in info)
 PY
 
 cat <<EOF

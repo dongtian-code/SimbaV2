@@ -7,6 +7,15 @@ an `env_name` kwarg. Observations are 39-D, actions 4-D, and every task runs a
 fixed 500-step episode -- MetaWorld never terminates early, it only truncates
 (which is why `configs/env/metaworld.yaml` sets `episodic: false`).
 
+On "v2" vs "v3": these name different things in the two MetaWorld generations.
+In the 2.x package the suffix WAS the reward-function version (`reach-v1` vs
+`reach-v2`). 3.x renamed the tasks to `-v3` -- a pure rename, 927 insertions for
+927 deletions -- and moved the reward version to its own `reward_function_version`
+parameter, which defaults to "v2" on all 50 environments. So `reach-v3` IS the
+`reach-v2` task everyone benchmarks on. The parameter cannot be passed through
+the "goal_observable" id (see make_metaworld_env), so the default is what
+applies -- which is the one we want.
+
 This deliberately does *not* go through `fancy_gym`: fancy_gym targets
 gymnasium 0.29 (it subclasses the `EnvCompatibility` wrapper gymnasium 1.0
 removed) and pins mujoco==2.3.3, neither of which is compatible with the
@@ -97,6 +106,21 @@ def _metaworld():
     """
     import metaworld
 
+    # PyPI's `metaworld` is 2.x: it exposes ALL_V2_ENVIRONMENTS_* instead and
+    # registers no "Meta-World/..." gymnasium ids at all, so `gym.make` below
+    # would fail too. Checking here turns that into one actionable line rather
+    # than an AttributeError six frames deep inside SyncVectorEnv construction.
+    if not hasattr(metaworld, "ALL_V3_ENVIRONMENTS"):
+        raise ImportError(
+            "The installed metaworld is not MetaWorld 3.x: "
+            f"version={getattr(metaworld, '__version__', 'unknown')}, "
+            f"path={getattr(metaworld, '__file__', 'unknown')}, "
+            "and it has no ALL_V3_ENVIRONMENTS. Install the 3.x fork this repo "
+            "expects:\n"
+            "    pip uninstall -y metaworld\n"
+            "    pip install 'git+https://github.com/dongtian-code/Metaworld.git@dt_branch'"
+        )
+
     return metaworld
 
 
@@ -129,11 +153,22 @@ def make_metaworld_env(
     # gymnasium's passive checker warns on every reset/step ("obs ... is not
     # within the observation space") and pays for a space check per step. Both
     # are pure overhead here.
+    # ONLY `env_name` and `seed` may be passed through to the creator. MetaWorld
+    # registers this id as `entry_point=lambda env_name, seed: <cls>(seed=seed)`
+    # -- a two-argument lambda with no **kwargs -- so any other keyword
+    # (render_mode, reward_function_version, ...) comes back as a TypeError from
+    # gymnasium's env creator. Two consequences worth knowing:
+    #   * the reward version is whatever the env class defaults to, which is
+    #     "v2" on all 50 tasks, i.e. the reward the benchmark is measured with;
+    #   * there is no render_mode, so `record_video` does not work through this
+    #     id. Keep `num_record_episodes: 0`.
+    # `disable_env_checker` is a parameter of gymnasium.make itself, not of the
+    # creator, so it does not hit the lambda: MetaWorld declares loose
+    # observation-space bounds and the passive checker would warn on every step.
     env = gym.make(
         _GOAL_OBSERVABLE_ID,
         env_name=task,
         seed=seed,
-        render_mode="rgb_array",
         disable_env_checker=True,
     )
 
