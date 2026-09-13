@@ -1,0 +1,49 @@
+# Cluster (DESY Maxwell) dependency set for the cw2 / MetaWorld runs.
+#
+# This is deliberately NOT deps/requirements.txt. That file pins the stack the
+# SimbaV2 paper's numbers were produced with (jax 0.4.25, numpy 1.24, mujoco
+# 3.1.6, a pre-1.0 gymnasium commit, d4rl) and is the right thing to reproduce
+# DMC/HumanoidBench results. MetaWorld 3.x needs gymnasium >= 1.1 and mujoco 3.3,
+# which that set cannot satisfy.
+#
+# The pins below match the environment the sibling RLAC repo already runs
+# MetaWorld on, so both projects can share one node image and one set of
+# hardware assumptions:
+#   conda create -n simbav2_env python=3.10
+#   pip install -r deps/requirements_maxwell.txt
+# See deps/setup_maxwell.sh, which does that plus the git dependencies.
+
+# --- JAX (CUDA 12). Drop the two jax-cuda12-* lines for a CPU-only install. ---
+jax==0.6.0
+jaxlib==0.6.0
+jax-cuda12-plugin==0.6.0
+jax-cuda12-pjrt==0.6.0
+flax==0.10.5
+optax==0.2.4
+chex==0.1.89
+tensorflow-probability==0.25.0
+
+numpy==2.2.5
+scipy==1.15.2
+
+# --- envs ---
+gymnasium==1.1.1
+mujoco==3.3.1
+# MetaWorld itself is a git dependency -- see deps/setup_maxwell.sh:
+#   pip install "git+https://github.com/dongtian-code/Metaworld.git@dt_branch"
+
+# --- config / launcher ---
+hydra-core==1.3.2
+omegaconf==2.3.0
+dotmap==1.3.30
+PyYAML==6.0.2
+# cw2 is a git dependency (the dt_branch fork) -- see deps/setup_maxwell.sh.
+
+# --- logging ---
+wandb==0.19.9
+# Pinned: wandb 0.19.9's protobuf dispatcher only branches on major versions
+# "3"/"4"/"5". With protobuf 6/7 installed it imports the wrong generated module
+# and dies with "cannot import name 'Deprecated' from wandb.proto.wandb_telemetry_pb2".
+protobuf==5.29.4
+tqdm==4.67.1
+imageio==2.37.0

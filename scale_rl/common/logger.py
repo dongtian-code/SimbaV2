@@ -6,14 +6,38 @@ import wandb
 
 
 class WandbTrainerLogger(object):
-    def __init__(self, cfg: Dict):
+    def __init__(
+        self,
+        cfg: Dict,
+        name: str = None,
+        run_id: str = None,
+        resume: str = None,
+        project: str = None,
+        entity: str = None,
+        group: str = None,
+    ):
+        """
+        args:
+            cfg: the resolved experiment config; logged as the run's config.
+            name: explicit run name (default: wandb's generated one).
+            run_id / resume: reattach to an existing run instead of creating a
+                new one. A preempted-and-requeued job passes the id it stored in
+                its checkpoint together with resume="allow", so the whole run
+                stays a single continuous W&B curve across restarts rather than
+                fragmenting into one run per SLURM allocation.
+            project / entity / group: override the corresponding cfg fields;
+                used by the cw2 launcher, which owns those names.
+        """
         self.cfg = cfg
         dict_cfg = OmegaConf.to_container(cfg, throw_on_missing=True)
 
-        wandb.init(
-            project=cfg.project_name,
-            entity=cfg.entity_name,
-            group=cfg.group_name,
+        self.wandb_run = wandb.init(
+            project=project or cfg.project_name,
+            entity=entity or cfg.entity_name,
+            group=group or cfg.group_name,
+            name=name,
+            id=run_id,
+            resume=resume,
             config=dict_cfg,
         )
 
@@ -30,7 +54,11 @@ class WandbTrainerLogger(object):
         log_data = {}
         log_data.update(self.average_meter_dict.averages())
         log_data.update(self.media_dict)
-        wandb.log(log_data, step=step)
+        self.wandb_run.log(log_data, step=step)
+
+    def finish(self) -> None:
+        if self.wandb_run is not None:
+            self.wandb_run.finish()
 
     def reset(self) -> None:
         self.average_meter_dict = AverageMeterDict()

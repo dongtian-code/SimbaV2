@@ -1,0 +1,130 @@
+---
+name: "SLURM"
+partition: "comgpu"          # allgpu (requeue) | comgpu/compgpu (cancel) | psgpu
+job-name: "SimbaV2-metaworld-comgpu"
+num_parallel_jobs: 8
+ntasks: 1
+cpus-per-task: 128
+mem: 64000
+time: 1440                   # minutes; comgpu's wall limit
+
+# comgpu CANCELS a preempted job -- Slurm does not bring it back the way allgpu's
+# requeue does. So main_cw2.py submits its own replacement: on SIGUSR1 every rep
+# packed into this job checkpoints, they meet at a checkpoint-ready barrier under
+# <path>/.preemption, exactly one of them re-`sbatch`es this job's own sbatch.sh
+# (with --array pinned to this array task), and then they all exit.
+#
+# To stop the chain without waiting for the running jobs:
+#   touch /gpfs/petra3/scratch/dongtian/simbav2_exp_result/.preemption/.disable_preemption_resubmit
+# or set disable_preemption_resubmit: true below and resubmit.
+preemption_mode: cancel
+auto_resume_from_latest_checkpoint: true
+resume_dir_name: "resume"
+disable_preemption_resubmit: false
+exclude_current_node_on_resubmit: true
+
+# The replacement job is only submitted once all 4 reps in this Slurm job have a
+# fresh checkpoint on disk. Without that, the replacement can start while a rep
+# is still writing; the new job would find that rep's active-run lock held and
+# skip it, silently dropping the run. 240s of the 300s USR1 grace period.
+checkpoint_ready_barrier_enabled: true
+checkpoint_ready_barrier_timeout: 240
+checkpoint_ready_barrier_poll_interval: 0.5
+checkpoint_ready_barrier_submit_on_timeout: false
+
+# Whole-node packing: 4 GPUs x 1 rep per GPU = 4 parallel reps, which must match
+# `reps_in_parallel` below. One rep per GPU -- no two runs share a device. The
+# horeka scheduler assigns each rep its own CUDA_VISIBLE_DEVICES and CPU affinity
+# slice (128 / 4 = 32 cores each), and forwards SIGUSR1 to every worker process.
+num_gpus: 4
+reps_per_gpu: 1
+scheduler: horeka
+
+sbatch_args:
+  requeue: ""                # lets Slurm recover failures that happen before Python starts (e.g. node loss)
+  signal: "B:USR1@300"
+#  gres: "gpu:4"             # rejected on Maxwell: GPUs are not a generic resource here
+#  constraint: "GPUx4&A100"
+
+sh_lines:
+  - "unset LD_PRELOAD"       # drop the login node's VirtualGL libvglfaker/libdlfaker preloads
+  - "export MPRL_GPU_ENV_AUTO_SELECT=0"
+  - "export CONDA_PREFIX=/gpfs/petra3/scratch/dongtian/miniconda3/envs/simbav2_env"
+  - 'export PATH="$CONDA_PREFIX/bin:$PATH"'
+  - "export MUJOCO_GL=egl"
+  # Not needed at reps_per_gpu: 1 -- each rep has its GPU to itself, so JAX's
+  # default preallocation is fine. Raising reps_per_gpu above 1 REQUIRES capping
+  # it (e.g. XLA_PYTHON_CLIENT_MEM_FRACTION=.45), or the second rep sharing a
+  # device dies on allocation.
+  # 4 JAX processes on one node would otherwise each spin up ~128 OMP threads.
+  - "export OMP_NUM_THREADS=16"
+
+experiment_copy_src: "../"
+experiment_copy_auto_dst: "/gpfs/petra3/scratch/dongtian/CODE_COPY_SIMBAV2/"
+
+---
+name: "SimbaV2-metaworld-comgpu"
+
+repetitions: 1
+# 8 tasks x 1 seed = 8 reps, 4 per node -> 2 Slurm array tasks. reps_in_parallel
+# MUST equal num_gpus * reps_per_gpu, or cw2's GPU scheduler asserts on the
+# mismatch. Each array task checkpoints and resubmits itself independently.
+reps_per_job: 4
+reps_in_parallel: 4
+
+# ceil(num_interaction_steps / chunk_size) = 5_000_000 / 5_000.
+iterations: &iterations 1000
+num_checkpoints: 100
+overwrite_checkpoints: true
+
+path: "/gpfs/petra3/scratch/dongtian/simbav2_exp_result"
+
+auto_resume_from_latest_checkpoint: true
+resume_dir_name: "resume"
+
+# NOTE: `group` defines the checkpoint resume lineage (main_cw2.py
+# _resume_scope_name feeds _checkpoint_config_fingerprint), so renaming it starts
+# a fresh lineage and abandons the existing checkpoints -- including across a
+# preemption/resubmit cycle.
+wandb:
+  project: "simbav2-metaworld"
+  group: "[simbav2] comgpu 8 tasks"
+  entity: null
+
+params:
+  config_name: "online_rl"
+  defaults:
+    agent: "simbaV2"
+    buffer: "numpy_uniform"
+    env: "metaworld"
+
+  chunk_size: 5000
+
+  env:
+    env_name: "metaworld/reach-v2"
+    num_env_steps: 5000000
+
+  buffer:
+    max_length: 1000000       # 4 reps x ~620 MB of buffer per checkpoint on this node
+    min_length: 5000
+
+  num_eval_episodes: 20
+  num_record_episodes: 0
+  evaluation_per_interaction_step: 50000
+  metrics_per_interaction_step: 50000
+  logging_per_interaction_step: 10000
+
+# The 8 tasks currently uncommented in the dt_rl comgpu config, so the two
+# projects' runs line up task-for-task.
+grid:
+  env:
+    env_name: [
+      "metaworld/assembly-v2",
+      "metaworld/basketball-v2",
+      "metaworld/coffee-push-v2",
+      "metaworld/disassemble-v2",
+      "metaworld/hammer-v2",
+      "metaworld/pick-place-wall-v2",
+      "metaworld/pick-out-of-hole-v2",
+      "metaworld/pick-place-v2",
+    ]

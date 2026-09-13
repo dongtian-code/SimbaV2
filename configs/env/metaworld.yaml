@@ -1,0 +1,29 @@
+##################################################################################
+# MetaWorld (ML1 single-task, goal-observable) -- 50 tasks
+##################################################################################
+
+env_type: 'metaworld'
+# Any of "assembly", "assembly-v2", "assembly-v3" or "metaworld/assembly-v2"
+# resolves to MetaWorld 3.x's "assembly-v3" (see scale_rl/envs/metaworld.py).
+# The "metaworld/<task>-v2" spelling is kept so a SimbaV2 run and an RLAC run of
+# the same task share an `env_name` in W&B and line up in the comparison plots.
+env_name: 'metaworld/reach-v2'
+num_env_steps: 5_000_000
+
+# MetaWorld tasks never terminate early -- an episode always runs the full 500
+# steps and ends by truncation. `episodic` feeds `agent.critic_use_cdq`, so this
+# also turns clipped double-Q off, matching how DMC/MyoSuite are configured.
+# Flip it to true if you want CDQ back.
+episodic: false
+
+seed: ${seed}
+num_train_envs: 1
+# num_eval_episodes must be divisible by num_eval_envs (scale_rl/evaluation.py).
+num_eval_envs: 1
+action_repeat: 1
+# MetaWorld actions are already in [-1, 1], so this rescaling is a no-op; kept
+# for symmetry with the other env configs.
+rescale_action: true
+# MetaWorld's own episode length. `gamma` in configs/online_rl.yaml is derived
+# from it: (500/5 - 1) / (500/5) = 0.99.
+max_episode_steps: 500

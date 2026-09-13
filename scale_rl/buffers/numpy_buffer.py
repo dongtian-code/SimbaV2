@@ -1,3 +1,4 @@
+import copy
 import os
 import pickle
 from collections import deque
@@ -167,6 +168,64 @@ class NpyUniformBuffer(BaseBuffer):
     def get_observations(self) -> np.ndarray:
         return self._observations[: self._num_in_buffer]
 
+    # ------------------------------------------------------------------ resume
+    # `save()` above writes a *dataset* (the valid transitions only, for offline
+    # reuse). `state_dict()`/`load_state_dict()` instead capture the buffer as a
+    # resumable ring: the write cursor and the pending n-step window matter as
+    # much as the data, because a preempted run has to continue adding exactly
+    # where it stopped. See scale_rl/common/checkpoint.py.
+    _STATE_ARRAYS = (
+        "_observations",
+        "_actions",
+        "_rewards",
+        "_terminateds",
+        "_truncateds",
+        "_next_observations",
+    )
+
+    def state_dict(self) -> dict:
+        # Until the ring wraps, only the first `_num_in_buffer` slots hold real
+        # data, so storing just those keeps early checkpoints small (the full
+        # allocation is max_length x obs_dim and would otherwise be written from
+        # the very first checkpoint on).
+        stored_length = min(self._num_in_buffer, self._max_length)
+        state = {
+            "num_in_buffer": int(self._num_in_buffer),
+            "current_idx": int(self._current_idx),
+            "stored_length": int(stored_length),
+            "max_length": int(self._max_length),
+            "n_step": int(self._n_step),
+            "n_step_transitions": copy.deepcopy(list(self._n_step_transitions)),
+        }
+        for name in self._STATE_ARRAYS:
+            state[name] = getattr(self, name)[:stored_length].copy()
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        if int(state["max_length"]) != int(self._max_length):
+            raise ValueError(
+                "Replay buffer checkpoint was written with max_length="
+                f"{state['max_length']}, but this buffer has max_length="
+                f"{self._max_length}. Resuming would silently reshape the ring."
+            )
+        if int(state["n_step"]) != int(self._n_step):
+            raise ValueError(
+                f"Replay buffer checkpoint was written with n_step={state['n_step']}, "
+                f"but this buffer has n_step={self._n_step}."
+            )
+
+        # reset() (re)allocates the arrays and clears the n-step window; the
+        # stored slice is then written back over the fresh allocation.
+        self.reset()
+        stored_length = int(state["stored_length"])
+        for name in self._STATE_ARRAYS:
+            getattr(self, name)[:stored_length] = state[name]
+        self._num_in_buffer = int(state["num_in_buffer"])
+        self._current_idx = int(state["current_idx"])
+        self._n_step_transitions = deque(
+            copy.deepcopy(state["n_step_transitions"]), maxlen=self._n_step
+        )
+
 
 class NpyPrioritizedBuffer(NpyUniformBuffer):
     def __init__(
@@ -241,3 +300,16 @@ class NpyPrioritizedBuffer(NpyUniformBuffer):
 
     def save(self, path: str) -> None:
         pass
+
+    def state_dict(self) -> dict:
+        # The inherited implementation would silently drop `_priority_tree`, so
+        # a resumed run would sample uniformly from a buffer that is supposed to
+        # be prioritized. Capture the tree before enabling this.
+        raise NotImplementedError(
+            "NpyPrioritizedBuffer does not support resumable checkpoints yet."
+        )
+
+    def load_state_dict(self, state: dict) -> None:
+        raise NotImplementedError(
+            "NpyPrioritizedBuffer does not support resumable checkpoints yet."
+        )

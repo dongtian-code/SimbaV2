@@ -1,0 +1,175 @@
+---
+name: "SLURM"
+partition: "psgpu"
+job-name: "SimbaV2-metaworld"
+num_parallel_jobs: 50
+ntasks: 1
+cpus-per-task: 8
+mem-per-cpu: 8000
+time: 5000
+
+preemption_mode: requeue
+# No `gres: "gpu:1"` here: Maxwell does not register GPUs as a generic resource,
+# so sbatch rejects it outright ("Invalid generic resource (gres) specification").
+# GPU selection goes through node *features* instead -- `sinfo -o "%N %f"` lists
+# what a partition offers. "GPUx1&A100" matches a single-GPU A100 node; note that
+# psgpu has exactly one of those, so a 50-job grid will serialise on it. Dropping
+# "&A100" widens the match to the P100 nodes.
+sbatch_args:
+  requeue: ""
+  signal: "B:USR1@300"
+  constraint: "GPUx1&A100"
+
+# cw2 only emits a `source activate ...` line when the SLURM section sets `venv`,
+# so the environment has to be set up here. Two things matter:
+#
+#   * MPRL_GPU_ENV_AUTO_SELECT=0 -- cw2's gpu_env_selector.sh runs AFTER these
+#     lines and, when that variable is 1 (it is exported from the login shell for
+#     another project), ignores CONDA_PREFIX entirely and probes its own candidate
+#     list, which defaults to policy_chunking_transformer_*. Those are torch envs
+#     with no jax, which is what caused "No module named 'jax'" crashes. With it
+#     set to 0 the selector takes its `elif [ -n "$CONDA_PREFIX" ]` branch and
+#     points MPRL_PYTHON_BIN at the env set below.
+#   * do NOT run `conda activate`. cw2 exports the submitting process's sys.path
+#     as PYTHONPATH before these lines run (cw_slurm.py get_py_path), so base
+#     conda's python would pick up the env's 3.10 stdlib and die with
+#     "AssertionError: SRE module mismatch". Setting CONDA_PREFIX and prepending
+#     its bin/ to PATH is enough.
+sh_lines:
+  - "unset LD_PRELOAD"   # drop the login node's VirtualGL libvglfaker/libdlfaker preloads
+  - "export MPRL_GPU_ENV_AUTO_SELECT=0"
+  - "export CONDA_PREFIX=/gpfs/petra3/scratch/dongtian/miniconda3/envs/simbav2_env"
+  - 'export PATH="$CONDA_PREFIX/bin:$PATH"'
+  - "export MUJOCO_GL=egl"
+
+# Relative to the working directory at submit time (cw_slurm.py get_exp_src), the
+# same as the sibling RLAC config uses.
+experiment_copy_src: "../"
+# Deliberately not the CODE_COPY/ that RLAC uses: cw2 appends a timestamp so the
+# two would not actually collide, but keeping them apart makes it obvious which
+# snapshot a job ran from.
+experiment_copy_auto_dst: "/gpfs/petra3/scratch/dongtian/CODE_COPY_SIMBAV2/"
+
+---
+name: "SimbaV2-metaworld"
+
+# Single seed per task, all 50 MetaWorld tasks (see `grid.env.env_name` below) --
+# repetitions=1 means each grid point (task) gets exactly one seed.
+repetitions: 1
+reps_per_job: 1
+reps_in_parallel: 1
+
+# iterations = ceil(num_interaction_steps / chunk_size). With action_repeat=1 and
+# num_train_envs=1, num_interaction_steps == num_env_steps, so this is
+# 5_000_000 / 5_000 = 1000. main_cw2.py recomputes this and warns on a mismatch.
+iterations: &iterations 1000
+num_checkpoints: 100         # a resume checkpoint every iterations/num_checkpoints = 10 chunks
+overwrite_checkpoints: true
+
+# Keep this separate from the other projects' result dirs: cw2 derives
+# `slurm_log` (<path>/slurmlog) and `slurm_output` (<path>/sbatch.sh) from `path`
+# (cw_slurm.py:_complete_optionals), so two projects sharing a `path` overwrite
+# each other's sbatch.sh on submit and interleave their slurm logs.
+path: "/gpfs/petra3/scratch/dongtian/simbav2_exp_result"
+
+auto_resume_from_latest_checkpoint: true
+resume_dir_name: "resume"
+
+# NOTE: `group` also defines the checkpoint resume lineage (main_cw2.py
+# _resume_scope_name feeds _checkpoint_config_fingerprint), so renaming the group
+# starts a fresh lineage and abandons the existing checkpoints.
+wandb:
+  project: "simbav2-metaworld"
+  group: "[simbav2 developing] smoke test"
+  entity: null
+
+# `params` is translated into Hydra overrides and composed against configs/ --
+# `config_name` picks the root config, `defaults` selects config groups
+# ("env=metaworld"), `chunk_size` is read by the cw2 launcher itself, and every
+# other key becomes a dotted override of the composed config. Anything not listed
+# here keeps the value from configs/online_rl.yaml and configs/{agent,env,buffer}/.
+params:
+  config_name: "online_rl"
+  defaults:
+    agent: "simbaV2"
+    buffer: "numpy_uniform"
+    env: "metaworld"
+
+  # Interaction steps per cw2 iterate() call, i.e. per checkpoint opportunity.
+  chunk_size: 5000
+
+  env:
+    # Task ids keep RLAC's "metaworld/<task>-v2" spelling so the same task logs
+    # under the same env_name in both projects (scale_rl/envs/metaworld.py maps
+    # it onto MetaWorld 3.x's "<task>-v3"). The only install needed is:
+    #   pip install "git+https://github.com/dongtian-code/Metaworld.git@dt_branch"
+    env_name: "metaworld/reach-v2"
+    num_env_steps: 5000000
+
+  buffer:
+    max_length: 1000000       # also the checkpoint size driver: 1M x 39 float64 x 2 ~= 620 MB
+    min_length: 5000          # random actions until the buffer holds this many transitions
+
+  num_eval_episodes: 20
+  num_record_episodes: 0      # video recording off; it needs an EGL render pass per eval frame
+  evaluation_per_interaction_step: 50000
+  metrics_per_interaction_step: 50000
+  logging_per_interaction_step: 10000
+
+# cw2 takes the cartesian product over all grid entries (itertools.product in
+# cw_config/conf_unfolder.py:params_combine) and appends the grid values to each
+# run's name, so this is 50 jobs -- one per MetaWorld task, one seed each.
+grid:
+  env:
+    env_name: [
+      "metaworld/assembly-v2",
+      "metaworld/basketball-v2",
+      "metaworld/bin-picking-v2",
+      "metaworld/box-close-v2",
+      "metaworld/button-press-topdown-v2",
+      "metaworld/button-press-topdown-wall-v2",
+      "metaworld/button-press-v2",
+      "metaworld/button-press-wall-v2",
+      "metaworld/coffee-button-v2",
+      "metaworld/coffee-pull-v2",
+      "metaworld/coffee-push-v2",
+      "metaworld/dial-turn-v2",
+      "metaworld/disassemble-v2",
+      "metaworld/door-close-v2",
+      "metaworld/door-lock-v2",
+      "metaworld/door-open-v2",
+      "metaworld/door-unlock-v2",
+      "metaworld/drawer-close-v2",
+      "metaworld/drawer-open-v2",
+      "metaworld/faucet-open-v2",
+      "metaworld/faucet-close-v2",
+      "metaworld/hammer-v2",
+      "metaworld/hand-insert-v2",
+      "metaworld/handle-press-side-v2",
+      "metaworld/handle-press-v2",
+      "metaworld/handle-pull-side-v2",
+      "metaworld/handle-pull-v2",
+      "metaworld/lever-pull-v2",
+      "metaworld/peg-insert-side-v2",
+      "metaworld/pick-place-wall-v2",
+      "metaworld/pick-out-of-hole-v2",
+      "metaworld/reach-v2",
+      "metaworld/push-back-v2",
+      "metaworld/push-v2",
+      "metaworld/pick-place-v2",
+      "metaworld/plate-slide-v2",
+      "metaworld/plate-slide-side-v2",
+      "metaworld/plate-slide-back-v2",
+      "metaworld/plate-slide-back-side-v2",
+      "metaworld/peg-unplug-side-v2",
+      "metaworld/push-wall-v2",
+      "metaworld/soccer-v2",
+      "metaworld/stick-push-v2",
+      "metaworld/stick-pull-v2",
+      "metaworld/reach-wall-v2",
+      "metaworld/shelf-place-v2",
+      "metaworld/sweep-into-v2",
+      "metaworld/sweep-v2",
+      "metaworld/window-open-v2",
+      "metaworld/window-close-v2",
+    ]

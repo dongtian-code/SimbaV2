@@ -131,6 +131,63 @@ python run_parallel.py \
 ```
 
 
+## MetaWorld on SLURM (cw2)
+
+`main_cw2.py` is a second entry point for preemptible cluster runs. It reuses
+`run_online.py`'s training loop but drives it from [cw2](https://github.com/ALRhub/cw2),
+so a job that Slurm preempts checkpoints itself and resumes exactly where it
+stopped after being requeued.
+
+```
+bash deps/setup_maxwell.sh                                        # build the conda env
+python main_cw2.py configs/cw2/metaworld_online.yml               # run locally, no SLURM
+python main_cw2.py configs/cw2/metaworld_online.yml -s            # psgpu: 50 tasks, 1 GPU each
+python main_cw2.py configs/cw2/metaworld_online_comgpu.yml -s     # comgpu: 8 tasks on one 4-GPU node
+python main_cw2.py configs/cw2/metaworld_online.yml -s -o         # ... overwriting an old submit
+```
+
+The two SLURM configs differ in how the partition preempts:
+
+| | `metaworld_online.yml` | `metaworld_online_comgpu.yml` |
+|---|---|---|
+| partition | psgpu (or allgpu) | comgpu |
+| `preemption_mode` | `requeue` — Slurm requeues the job | `cancel` — the job submits its own replacement |
+| packing | 1 rep per job | 4 reps per node, one per GPU (`num_gpus: 4`, `reps_per_gpu: 1`) |
+
+In cancel mode a preempted job checkpoints every rep, waits at a checkpoint-ready
+barrier under `<path>/.preemption`, and exactly one rep re-`sbatch`es the job's own
+`sbatch.sh` with `--array` pinned to this array task. To stop that chain:
+
+```
+touch <path>/.preemption/.disable_preemption_resubmit
+```
+
+`reps_in_parallel` must equal `num_gpus * reps_per_gpu` or cw2's GPU scheduler
+asserts. Raising `reps_per_gpu` above 1 also requires capping JAX's memory
+(`XLA_PYTHON_CLIENT_MEM_FRACTION` in `sh_lines`), since JAX otherwise claims 75%
+of a GPU on first use and the second rep sharing that device dies on allocation.
+
+What is different from `run_online.py`:
+
+- **Config.** The cw2 YAML's `params` block is translated into Hydra overrides
+  and composed against this repo's own `configs/` tree, so `configs/online_rl.yaml`
+  still owns every derived value. `defaults:` selects config groups
+  (`env: metaworld`), everything else becomes a dotted override.
+- **Checkpoints.** `scale_rl/common/checkpoint.py` writes parameters, optimizer
+  state, the agent PRNG key, the normalizer statistics and the whole replay
+  buffer as one atomic pickle -- unlike `BaseAgent.save()`, which stores weights
+  only and is meant for transfer, not resume.
+- **Environments.** `configs/env/metaworld.yaml` + `scale_rl/envs/metaworld.py`
+  add MetaWorld 3.x's 50 ML1 tasks (goal-observable, 39-D observations, 500-step
+  episodes, no early termination).
+- **Dependencies.** MetaWorld 3.x needs gymnasium >= 1.1 and mujoco 3.3, which
+  `deps/requirements.txt` (the paper's pinned stack) cannot provide. Use
+  `deps/requirements_maxwell.txt` for these runs.
+
+On resume the environment is re-`reset()` rather than restored to its exact
+mid-episode simulator state, so only the episode that was in flight is lost.
+
+
 ## Analysis
 
 Please refer to `/analysis` to visualize the experimental results provided in the paper.
