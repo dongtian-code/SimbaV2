@@ -115,6 +115,8 @@ params:
     max_length: 100000        # ~62 MB per checkpoint, so a write takes seconds
     min_length: 1000          # short random-action warmup
 
+  updates_per_interaction_step: 2   # match the real runs
+
   num_eval_episodes: 4        # 4 x 500 steps; enough to prove eval works
   num_record_episodes: 0
   evaluation_per_interaction_step: 5000

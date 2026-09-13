@@ -88,7 +88,7 @@ resume_dir_name: "resume"
 # preemption/resubmit cycle.
 wandb:
   project: "simbav2-metaworld"
-  group: "[simbav2] comgpu smoke test"
+  group: "[simbav2] metaworld 50 tasks 5M, 140926"
   entity: null
 
 params:
@@ -105,8 +105,27 @@ params:
     num_env_steps: 5000000
 
   buffer:
-    max_length: 1000000       # 4 reps x ~620 MB of buffer per checkpoint on this node
+    max_length: 1000000       # 4 reps x ~620 MB of buffer per checkpoint on this node.
+                              # NOTE: RLAC keeps its whole 5M history (buffer_size:
+                              # 5000000); this holds the most recent 1M, which is
+                              # SimbaV2's own default. Raising it to 5M would make a
+                              # checkpoint ~3.1 GB per rep, 12 GB per node write.
     min_length: 5000
+
+  # UTD (update-to-data ratio). configs/online_rl.yaml defines this as
+  # `updates_per_interaction_step: ${action_repeat}`, so on MetaWorld -- which is
+  # run without action repeat, like every other project here -- it would collapse
+  # to 1. SimbaV2 runs all of its own benchmarks (DMC, HumanoidBench, MyoSuite)
+  # at 2, so set it explicitly rather than inheriting it from the control
+  # frequency. Do NOT reach for action_repeat: 2 instead -- that halves the
+  # control frequency and changes the task.
+  #
+  # Consequences: 5M env steps x 2 = 10M gradient updates, roughly 2x the
+  # runtime, and agent.learning_rate_decay_step follows automatically because it
+  # is derived from num_interaction_steps * updates_per_interaction_step.
+  # RLAC runs at utd_ratio: 1, so the two are matched on environment samples
+  # (5M each), not on gradient steps -- report the UTD alongside the results.
+  updates_per_interaction_step: 2
 
   num_eval_episodes: 20
   num_record_episodes: 0
