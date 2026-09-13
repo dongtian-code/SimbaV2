@@ -129,7 +129,10 @@ def update_target_network(
     target_network: Network,
     target_tau: bool,
 ) -> Tuple[Network, Dict[str, float]]:
-    new_target_params = jax.tree_map(
+    # jax.tree_util.tree_map, not jax.tree_map: the top-level alias was removed in
+    # JAX 0.6. The jax_util spelling works on every JAX version, including the
+    # 0.4.25 that deps/requirements.txt pins, so this stays compatible both ways.
+    new_target_params = jax.tree_util.tree_map(
         lambda p, tp: p * target_tau + tp * (1 - target_tau),
         network.params,
         target_network.params,

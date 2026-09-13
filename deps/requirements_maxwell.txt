@@ -14,6 +14,11 @@
 # See deps/setup_maxwell.sh, which does that plus the git dependencies.
 
 # --- JAX (CUDA 12). Drop the two jax-cuda12-* lines for a CPU-only install. ---
+# 0.6.0 rather than the 0.4.25 in deps/requirements.txt, to match rlac_env so the
+# two projects share one CUDA/cuDNN stack. scale_rl was written against 0.4.x, so
+# APIs removed since then had to be fixed at the source -- currently only
+# `jax.tree_map` -> `jax.tree_util.tree_map` in {simba,simbaV2}_update.py. If you
+# touch scale_rl, keep to spellings that work on both versions.
 jax==0.6.0
 jaxlib==0.6.0
 jax-cuda12-plugin==0.6.0
