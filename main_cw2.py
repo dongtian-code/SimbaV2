@@ -90,6 +90,29 @@ def _safe_path_component(value):
     return f'{safe[:80]}_{digest}'
 
 
+def _wandb_run_name(cw_config):
+    """A W&B run name that is unique per repetition.
+
+    The previous `sd{seed:03d}` + `s_{SLURM_JOB_ID}` was not: with one seed per
+    grid point every run is seed 0, and every repetition packed into the same
+    Slurm job shares SLURM_JOB_ID -- so all four reps on a node reported the one
+    name ("sd000s_24668088"), with nothing in it identifying the task.
+
+    cw2's `_experiment_name` is "<name>__<grid suffix>", i.e. unique per grid
+    point, so the task goes in front. The Slurm job id is deliberately dropped:
+    it changes on every requeue, which would rename a resumed run each time.
+    """
+    seed = int(cw_config.get('seed', 0))
+    grid_tag = str(cw_config.get('_experiment_name') or '')
+    prefix = f"{cw_config.get('name', '')}__"
+    if grid_tag.startswith(prefix):
+        grid_tag = grid_tag[len(prefix):]
+    # Grid values may contain "/" ("metaworld/assembly-v2") and cw2 keeps it in
+    # the name; the last segment is the readable part.
+    grid_tag = re.sub(r'[^0-9A-Za-z._-]+', '_', grid_tag.rsplit('/', 1)[-1]).strip('_')
+    return f'{grid_tag}_sd{seed:03d}' if grid_tag else f'sd{seed:03d}'
+
+
 def _resume_scope_name(cw_config):
     scope = cw_config.get('resume_scope_name')
     if scope is None:
@@ -1192,9 +1215,7 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
             self.observations, _ = self.train_env.reset()
 
         # --- logging ----------------------------------------------------------
-        exp_name = f"sd{cw_config['seed']:03d}"
-        if os.environ.get('SLURM_JOB_ID'):
-            exp_name += f"s_{os.environ['SLURM_JOB_ID']}"
+        exp_name = _wandb_run_name(cw_config)
         wandb_cfg = cw_config.get('wandb', {}) if isinstance(cw_config.get('wandb'), dict) else {}
 
         # Write the run's identity back into cfg before it is logged, so the
@@ -1210,12 +1231,33 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
         cfg.exp_name = exp_name
         cfg.save_path = self.save_model_dir
 
-        self.logger = WandbTrainerLogger(
-            cfg,
-            name=exp_name,
-            run_id=wandb_run_id,
-            resume=wandb_resume,
-        )
+        # A checkpoint carries the id of the W&B run it was logging to, so a
+        # requeued job continues one curve instead of fragmenting per allocation.
+        # But if that run has since been deleted in the W&B UI, wandb.init fails
+        # with "CommError: ... 410 ... previously created and deleted; try a new
+        # run id" -- which used to kill the job inside initialize() and throw away
+        # a perfectly good checkpoint over a logging-only problem. Fall back to a
+        # fresh W&B run instead; training still resumes from the checkpoint.
+        # Only the resume path is retried, and only once, so a real outage or auth
+        # failure still surfaces rather than being swallowed.
+        try:
+            self.logger = WandbTrainerLogger(
+                cfg,
+                name=exp_name,
+                run_id=wandb_run_id,
+                resume=wandb_resume,
+            )
+        except Exception as exc:
+            if wandb_run_id is None:
+                raise
+            print(
+                f'[wandb] Could not resume run {wandb_run_id!r} '
+                f'({type(exc).__name__}: {exc}). Starting a fresh W&B run; '
+                'training still resumes from the checkpoint.',
+                flush=True,
+            )
+            self.logger = WandbTrainerLogger(
+                cfg, name=exp_name, run_id=None, resume=None)
         self.wandb_run = self.logger.wandb_run
 
         # Initial evaluation, only on a fresh run: after a resume the run's wandb
