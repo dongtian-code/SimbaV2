@@ -148,8 +148,8 @@ resume_scope_name: "metaworld_randinit_lastframe_14.Sep.2026b"
 # Keeping this in ONE file matters: a forked "supplement" config would have to
 # hold `params` byte-identical forever, and any drift would silently stop the
 # seeds from being seeds of the same configuration.
-seed: 1
-repetitions: 4
+seed: 0
+repetitions: 5
 reps_per_job: 4
 reps_in_parallel: 4
 
