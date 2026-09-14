@@ -122,7 +122,7 @@ resume_dir_name: "resume"
 # it after a run starts abandons that run's checkpoints.
 wandb:
   project: "simbav2-metaworld"
-  group: "[simbav2] metaworld 50 tasks 5M, randomized init, 140926"
+  group: "[simbav2] metaworld 50 tasks 5M, randomized init, 140926, success last step"
   entity: null
 
 params:
