@@ -172,4 +172,30 @@ def make_metaworld_env(
         disable_env_checker=True,
     )
 
+    # MetaWorld's goal-observable classes are constructed *frozen*. Their
+    # generated __init__ (metaworld/env_dict.py::_create_observable_goal_envs)
+    # does one throwaway reset and then sets `_freeze_rand_vec = True`, after
+    # which `SawyerXYZEnv._get_state_rand_vec()` returns the cached
+    # `_last_rand_vec` on every subsequent reset. Left alone, the env therefore
+    # replays ONE fixed object pose + goal forever:
+    #   * training solves a single instance, not the task distribution the
+    #     MetaWorld benchmark is defined over -- a much easier problem;
+    #   * evaluation over N episodes is N identical rollouts (the eval policy is
+    #     deterministic, temperature=0), so `avg_success` can only ever be 0.0
+    #     or 1.0 instead of a success *rate*.
+    #
+    # Unfreezing restores the per-reset draw from `_random_reset_space`, and
+    # `seeded_rand_vec` makes that draw come from the env's seeded `np_random`
+    # instead of the global numpy RNG, so runs stay reproducible per seed
+    # (`initialize` already called `env.seed(seed)`).
+    #
+    # These are exactly the two lines fancy_gym applied in
+    # `fancy_gym/meta/metaworld_adapter.py::make_metaworld`, which is what the
+    # published MetaWorld baselines were run through. Omitting them silently
+    # changes the benchmark, so keep them in step with the sibling RLAC repo
+    # (`envs/metaworld_utils.py`).
+    unwrapped = env.unwrapped
+    unwrapped._freeze_rand_vec = False
+    unwrapped.seeded_rand_vec = True
+
     return env

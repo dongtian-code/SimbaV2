@@ -46,27 +46,39 @@ def evaluate(
             returns += rewards * (1 - dones)
             lengths += 1 - dones
 
-            if "success" in infos:
-                successes += infos["success"].astype("float") * (1 - dones)
+            # Success is taken from the LAST step of each episode -- the value at
+            # the step where that sub-env terminated or truncated -- NOT "did it
+            # succeed at any point". This is the stricter reading: on tasks where
+            # the object can be pushed into the goal region and then drift back
+            # out (push, sweep, soccer, plate-slide) a run only counts if it is
+            # still solved when the episode ends. It also matches the sibling
+            # RLAC repo, whose `evaluation.py` reads the final info once after
+            # its rollout loop -- the two numbers have to mean the same thing to
+            # be plotted against each other.
+            #
+            # Where the ending step's info lives depends on autoreset. Under
+            # gymnasium's SameStep autoreset (see `create_vec_env`) the vector
+            # env resets in the same step it ends, so the top-level `infos`
+            # describes the *already reset* env and the real final info is moved
+            # into `infos["final_info"]` (a dict of batched arrays, masked by
+            # `infos["_final_info"]`). final_info therefore has to be checked
+            # first; the plain-`infos` branch covers ordinary mid-episode steps
+            # and any autoreset mode that reports the final info in place.
+            step_success = None
+            final_info = infos.get("final_info")
+            if isinstance(final_info, dict) and "success" in final_info:
+                step_success = np.asarray(final_info["success"], dtype=float).reshape(n)
+                ended = np.asarray(
+                    infos.get("_final_info", np.ones(n, dtype=bool))
+                ).reshape(n).astype(bool)
+            elif "success" in infos:
+                step_success = np.asarray(infos["success"], dtype=float).reshape(n)
+                ended = np.ones(n, dtype=bool)
 
-            elif "final_info" in infos:
-                final_successes = np.zeros(n)
-                for idx in range(n):
-                    final_info = infos["final_info"]
-
-                    if "success" in final_info:
-                        try:
-                            final_successes[idx] = final_info["success"][idx].astype(
-                                "float"
-                            )
-                        except:
-                            final_successes[idx] = np.array(
-                                final_info["success"][idx]
-                            ).astype("float")
-                successes += final_successes * (1 - dones)
-
-            else:
-                pass
+            if step_success is not None:
+                # Overwrite while the sub-env is still running and freeze it once
+                # done, so what survives is that sub-env's final-step value.
+                successes = np.where(ended & (dones == 0), step_success, successes)
 
             # once an episode is done in a sub-environment, we assume it to be done.
             # also, we assume to be done whether it is terminated or truncated during evaluation.
@@ -79,7 +91,8 @@ def evaluate(
         for env_idx in range(n):
             total_returns.append(returns[env_idx])
             total_lengths.append(lengths[env_idx])
-            total_successes.append(successes[env_idx].astype("bool").astype("float"))
+            # already the final step's 0/1 value -- no "ever succeeded" collapse
+            total_successes.append(float(successes[env_idx]))
 
     eval_info = {
         "avg_return": np.mean(total_returns),
