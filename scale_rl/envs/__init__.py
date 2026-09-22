@@ -83,6 +83,9 @@ def create_vec_env(
         elif env_type == 'metaworld':
             from scale_rl.envs.metaworld import make_metaworld_env
             env = make_metaworld_env(env_name, seed, **kwargs)
+        elif env_type == 'fancy':
+            from scale_rl.envs.fancy import make_fancy_env
+            env = make_fancy_env(env_name, seed, **kwargs)
         elif env_type == "d4rl":
             from scale_rl.envs.d4rl import make_d4rl_env
             env = make_d4rl_env(env_name, seed, **kwargs)

@@ -1,0 +1,207 @@
+---
+name: "SLURM"
+partition: "allgpu"          # allgpu (requeue) | comgpu/compgpu (cancel) | psgpu
+job-name: "SimbaV2-boxpushing-allgpu"
+num_parallel_jobs: 40        # Array throttle. This sweep is 2 critic widths x 2
+                             # critic depths x 5 seeds = 20 runs, far below the
+                             # 250-run MetaWorld launch, so this is effectively
+                             # unthrottled and the real limit is allgpu's own
+                             # queued-job cap. With num_gpus=auto it is not one
+                             # array: cw2 submits one per GPU-size group and
+                             # _auto_gpu_group_throttles splits this number across
+                             # them. To change it on an already-submitted launch:
+                             #   scontrol update JobId=<array job id> ArrayTaskThrottle=40
+ntasks: 1
+cpus-per-task: 64            # num_gpus=auto OVERWRITES this per array task with
+                             # gpu_count * reps_per_gpu * cpus_per_rep, where
+                             # cpus_per_rep is derived from THIS value:
+                             # 64 / (max(auto_gpu_node_counts) * reps_per_gpu) = 64/4 = 16.
+#
+# Deliberately NO `cpus_per_rep:` key -- see configs/cw2/metaworld_online_allgpu.yml
+# for why setting it turns the scheduler's self-adjusting branch into a hard assert.
+# 16 CPUs per rep also has to cover the 4 AsyncVectorEnv worker processes that
+# num_train_envs: 4 starts (one MuJoCo sim each); they are idle most of the time,
+# waiting on the rep's gradient updates.
+mem-per-cpu: 1000            # per-CPU, so memory scales with the group's node size:
+                             # GPUx1 -> 16 cpus -> 16 GB, GPUx4 -> 64 cpus -> 64 GB.
+                             # A flat `mem:` would hand a 1-GPU node running 1 rep
+                             # the same budget as a 4-GPU node running 4. cw2 rejects
+                             # setting both mem and mem-per-cpu.
+time: 4320                   # minutes (72 h). Generous on purpose -- preemption is
+                             # handled by requeue, so a long wall limit costs nothing.
+                             # The gradient-step count is the same 10M as the
+                             # MetaWorld launch (see updates_per_interaction_step),
+                             # which ran roughly 8-11 h per rep, and this also
+                             # absorbs several preemption cycles.
+
+# allgpu REQUEUES a preempted job: Slurm brings the same array task back by
+# itself, so on SIGUSR1 every rep just checkpoints and quiesces and the requeued
+# job picks the checkpoints back up. No self-resubmission logic here.
+preemption_mode: requeue
+auto_resume_from_latest_checkpoint: true
+resume_dir_name: "resume"
+
+# Let cw2 size each array task to whatever GPU nodes are actually idle at submit
+# time. Forbids `gres`/`gpus*` in sbatch_args and a hand-written `constraint`:
+# auto OVERWRITES sbatch_args["constraint"] with "GPUx{n}&(<auto_gpu_models>)".
+num_gpus: auto
+
+# P100 (compute capability 6.0, 46 nodes) is the one family deliberately
+# excluded: it forces XLA off the bundled ptxas onto the driver JIT and measured
+# ~6x slower than A100 on the identical MetaWorld config. A sweep is only
+# finished when its SLOWEST run finishes.
+auto_gpu_models: ["A100", "V100", "H100", "H200", "L40S", "A6000", "RTX6000", "RTX8000"]
+auto_gpu_node_counts: [1, 2, 4]
+auto_gpu_fallback_count: 4          # must appear in auto_gpu_node_counts
+auto_gpu_subtract_pending_priority: true   # reserve matching pending Priority jobs
+                                           # before claiming idle nodes
+reps_per_gpu: 1                     # one run per GPU -- never two on a device
+scheduler: horeka
+
+sbatch_args:
+  requeue: ""                # lets Slurm recover failures before Python starts (node loss)
+  signal: "B:USR1@300"       # 300 s of grace; main_cw2.py checkpoints on USR1
+
+sh_lines:
+  - "unset LD_PRELOAD"       # drop the login node's VirtualGL libvglfaker/libdlfaker preloads
+  # MPRL_GPU_ENV_AUTO_SELECT MUST stay 0: with 1 it ignores CONDA_PREFIX and
+  # probes dt_rl's torch environments, which is what produced "No module named 'jax'".
+  - "export MPRL_GPU_ENV_AUTO_SELECT=0"
+  - "export CONDA_PREFIX=/gpfs/petra3/scratch/dongtian/miniconda3/envs/simbav2_env"
+  - 'export PATH="$CONDA_PREFIX/bin:$PATH"'
+  # Prefer the ptxas from this env's own nvidia-cuda-nvcc-cu12 wheel over the
+  # node's /usr/local/cuda, whose version differs from node to node on Maxwell.
+  # SimbaV2 does NOT survive "ptxas too old": it hits the condition while
+  # compiling the agent's networks, where it is raised as XlaRuntimeError and
+  # kills the rep seconds after launch. Never fails the job if the wheel is missing.
+  - 'PTXAS_BIN="$(ls -d "$CONDA_PREFIX"/lib/python*/site-packages/nvidia/cuda_nvcc/bin 2>/dev/null | head -1)"; if [ -x "$PTXAS_BIN/ptxas" ]; then export PATH="$PTXAS_BIN:$PATH"; echo "[slurm] ptxas: $PTXAS_BIN"; else echo "[slurm] WARNING: no nvidia-cuda-nvcc-cu12 ptxas in $CONDA_PREFIX; XLA will use the node CUDA and may fail with \"ptxas too old\""; fi'
+  - "export MUJOCO_GL=egl"
+  # scale_rl/envs/fancy.py rewrites fancy_gym's MuJoCo-2 model XMLs into a
+  # content-addressed cache the first time an env is built (the installed
+  # fancy_gym stays untouched -- it is shared with dt_rl, which runs on mujoco
+  # 2.3.3). $HOME works, but scratch keeps it off the home quota. Safe to share
+  # across reps and across the AsyncVectorEnv workers: the build is atomic
+  # (staged + renamed).
+  - "export FANCY_GYM_ASSET_CACHE_DIR=/gpfs/petra3/scratch/dongtian/fancy_gym_mujoco3_assets"
+  # Not needed at reps_per_gpu: 1 -- each rep has its GPU to itself, so JAX's
+  # default preallocation is fine. Raising reps_per_gpu above 1 REQUIRES capping
+  # it (e.g. XLA_PYTHON_CLIENT_MEM_FRACTION=.45).
+  # cpus_per_rep is 16, and up to 4 reps share a node. Without this each JAX
+  # process sizes its thread pool from the node's full core count and they
+  # oversubscribe each other -- which now also applies to the env workers.
+  - "export OMP_NUM_THREADS=8"
+
+experiment_copy_src: "../"
+experiment_copy_auto_dst: "/gpfs/petra3/scratch/dongtian/CODE_COPY_SIMBAV2/"
+
+---
+name: "SimbaV2-boxpushing-allgpu"
+
+# First BoxPushing lineage; nothing earlier can be resumed into it.
+resume_scope_name: "boxpushing_randinit_4envs_21.Sep.2026"
+
+# 4 critic shapes x 5 seeds = 20 runs. reps_per_job / reps_in_parallel are
+# placeholders: with num_gpus=auto, cw2 overwrites BOTH per array task from the
+# node size it assigned, so a GPUx1 task runs 1 rep and a GPUx4 task runs 4. The
+# usual "reps_in_parallel must equal num_gpus * reps_per_gpu" assertion is
+# satisfied by that per-task rewrite, not by the numbers written here.
+# Seeds 0-4: cw2 unfolds repetitions as _rep_idx 0..repetitions-1 and
+# main_cw2.py's prepare_rep_configs turns that into `seed = seed + _rep_idx`,
+# then renames each run's directory to rep_<seed>. A run's on-disk identity is
+# its SEED, not its repetition index, and `repetitions` is not part of the
+# checkpoint fingerprint -- raising it later adds seeds without disturbing the
+# ones already on disk.
+seed: 0
+repetitions: 5
+reps_per_job: 4
+reps_in_parallel: 4
+
+# iterations = ceil(num_interaction_steps / chunk_size), and main_cw2.py ASSERTS
+# that equality at startup. num_interaction_steps is
+# num_env_steps / (num_train_envs * action_repeat) = 5_000_000 / 4 = 1_250_000,
+# so this is 1_250_000 / 5_000 = 250 -- a QUARTER of the MetaWorld launch's 1000,
+# purely because four envs advance the same 5M environment steps in a quarter as
+# many interaction steps. Change num_train_envs and this has to follow.
+iterations: &iterations 250
+num_checkpoints: 25          # a resume checkpoint every iterations/num_checkpoints = 10 chunks
+overwrite_checkpoints: true
+
+# Keep this separate from the other projects' result roots: cw2 derives
+# `slurm_log` and `slurm_output` from `path`, so two projects sharing a `path`
+# overwrite each other's sbatch.sh and interleave their slurm logs.
+path: "/gpfs/petra3/scratch/dongtian/simbav2_exp_result"
+
+auto_resume_from_latest_checkpoint: true
+resume_dir_name: "resume"
+
+# NOTE: `group` does NOT control the checkpoint lineage while `resume_scope_name`
+# above is set -- main_cw2.py::_resume_scope_name reads that key first.
+wandb:
+  project: "simbav2-boxpushing"
+  group: "[simbav2] boxpushing randinit dense 5M, 4envs, criticsweep, 210926"
+  entity: null
+
+params:
+  config_name: "online_rl"
+  defaults:
+    agent: "simbaV2"
+    buffer: "numpy_uniform"
+    env: "box_pushing"
+
+  chunk_size: 5000            # interaction steps per cw2 iteration
+
+  env:
+    # fancy_gym's BoxPushing, built without importing fancy_gym (its package
+    # __init__ needs gymnasium.wrappers.EnvCompatibility, removed in gymnasium
+    # 1.0). The only install needed -- note --no-deps, it pins mujoco==2.3.3:
+    #   pip install --no-deps "git+https://github.com/DongTian95/fancy_gymnasium.git@dt_branch"
+    # or rerun deps/setup_maxwell.sh.
+    env_name: "fancy/BoxPushingRandomInitDense-v0"
+    num_env_steps: 5000000
+    # Four envs stepped per interaction step: 4x the environment samples per
+    # step, at an unchanged 5M-step budget. This is what makes iterations 250.
+    num_train_envs: 4
+
+  buffer:
+    max_length: 1000000       # SimbaV2's own default, as on MetaWorld. NOTE RLAC
+                              # keeps its whole 5M history; this holds the most
+                              # recent 1M. Raising it to 5M would make a checkpoint
+                              # ~3 GB per rep, 12 GB per GPUx4 node write.
+    min_length: 5000          # transitions, so reached after 1250 interaction
+                              # steps once four envs add four per step
+
+  # UTD. configs/online_rl.yaml defines this as
+  # `updates_per_interaction_step: ${action_repeat}`, which would collapse to 1.
+  # SimbaV2 runs all of its own benchmarks at 2 updates per environment sample,
+  # and an interaction step now yields num_train_envs = 4 samples, so 4 x 2 = 8
+  # keeps that ratio exactly where the MetaWorld launch had it. The 4x asked for
+  # here is in the SAMPLING, not in the update ratio; total gradient steps are
+  # unchanged at 1.25M x 8 = 10M. The matching RLAC config scales its own
+  # utd_ratio 1 -> 4 for the same reason.
+  # Do NOT reach for action_repeat: 4 instead -- that quarters the control
+  # frequency and changes the task.
+  updates_per_interaction_step: 8
+
+  num_eval_episodes: 20       # matches RLAC's eval_episodes
+  num_record_episodes: 0      # BoxPushing does support render_mode, but recording
+                              # is off here to keep it in step with the MetaWorld
+                              # runs (and off the eval critical path)
+  # These are all in INTERACTION steps, so each is a quarter of the MetaWorld
+  # config's value to land on the same cadence in ENVIRONMENT steps: evaluate and
+  # log metrics every 50k env steps, log every 10k.
+  evaluation_per_interaction_step: 12500
+  metrics_per_interaction_step: 12500
+  logging_per_interaction_step: 2500
+
+# The sweep: critic capacity, in width and then in depth (the actor is untouched
+# at 1 block of 128, so any difference is the critic's). critic_scaler_init,
+# critic_scaler_scale and critic_alpha_init/scale are all interpolations of these
+# two keys in configs/agent/simbaV2.yaml, so they follow automatically -- do not
+# pin them here.
+#   critic_hidden_dim 512  = SimbaV2's default and what the MetaWorld runs used
+#   critic_num_blocks 2    = same
+# giving a 2x2 grid whose (512, 2) corner is the baseline.
+grid:
+  agent:
+    critic_hidden_dim: [512, 1024]
+    critic_num_blocks: [2, 4]

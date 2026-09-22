@@ -100,8 +100,24 @@ clone_or_reuse_repo "cw2" "git@github.com:DongTian95/cw2.git" "dt_branch"
 log "Installing MetaWorld 3.x into this environment only (not into $DEPS_DIR)."
 run python -m pip install --no-cache-dir "git+https://github.com/dongtian-code/Metaworld.git@dt_branch"
 
+# fancy_gym, for the BoxPushing envs (scale_rl/envs/fancy.py). Also non-editable
+# and NOT shared through $DEPS_DIR: that checkout is dt_rl's, whose jobs run
+# against it live on mujoco 2.3.3.
+#
+# --no-deps is MANDATORY -- fancy_gym pins mujoco==2.3.3 and would drag the env
+# back to MuJoCo 2. Nothing of fancy_gym is ever imported either: its package
+# __init__ subclasses gymnasium.wrappers.EnvCompatibility, which gymnasium 1.0
+# removed, so `import fancy_gym` cannot run on this stack at all.
+# scale_rl/envs/fancy.py loads the single env module out of the installed tree in
+# isolation, which is why the package still has to be installed even though it is
+# never imported as a whole.
+log "Installing fancy_gym (BoxPushing) into this environment only, without its pins."
+run python -m pip install --no-cache-dir --no-deps \
+    "git+https://github.com/DongTian95/fancy_gymnasium.git@dt_branch"
+
 # MetaWorld 2.x, if it was ever installed here, pins mujoco<3.0.0 and drags the
-# whole env back to 2.3.x. Re-assert the pin after the MetaWorld install.
+# whole env back to 2.3.x. fancy_gym would do the same if its pins were ever
+# resolved. Re-assert the pin after both installs.
 run python -m pip install "mujoco==3.3.1"
 
 log "Installing this repo (scale_rl) in editable mode."
@@ -136,6 +152,16 @@ env = make_metaworld_env(METAWORLD_MT50[0], seed=0)
 obs, info = env.reset()
 print("  probe:", METAWORLD_MT50[0], "obs", obs.shape,
       "act", env.action_space.shape, "success in info:", "success" in info)
+
+# NOT `import fancy_gym` -- that is exactly what does not work on gymnasium 1.1.
+# Build the env the repo actually uses instead, and step it once: a MuJoCo-2-only
+# model XML fails when the model is compiled, not at import.
+from scale_rl.envs.fancy import make_fancy_env
+bp_env = make_fancy_env("fancy/BoxPushingRandomInitDense-v0", seed=0)
+bp_obs, _ = bp_env.reset()
+bp_obs, _, _, _, bp_info = bp_env.step(bp_env.action_space.sample())
+print("  probe: BoxPushingRandomInitDense obs", bp_obs.shape,
+      "act", bp_env.action_space.shape, "success in info:", "success" in bp_info)
 PY
 
 cat <<EOF
@@ -147,6 +173,10 @@ cat <<EOF
 Submit the MetaWorld grid with:
 
   python main_cw2.py configs/cw2/metaworld_online.yml -s
+
+Submit the BoxPushing critic sweep with:
+
+  python main_cw2.py configs/cw2/boxpushing_online_allgpu.yml -s
 
 Check the CONDA_PREFIX in configs/cw2/metaworld_online.yml points at this env:
 

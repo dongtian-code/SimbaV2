@@ -144,9 +144,18 @@ python main_cw2.py configs/cw2/metaworld_online.yml               # run locally,
 python main_cw2.py configs/cw2/metaworld_online.yml -s            # psgpu: 50 tasks, 1 GPU each
 python main_cw2.py configs/cw2/metaworld_online_comgpu.yml -s     # comgpu: 8 tasks on one 4-GPU node
 python main_cw2.py configs/cw2/metaworld_online.yml -s -o         # ... overwriting an old submit
+python main_cw2.py configs/cw2/boxpushing_online_allgpu.yml -s    # allgpu: BoxPushing critic sweep
 ```
 
-The two SLURM configs differ in how the partition preempts:
+`boxpushing_online_allgpu.yml` is the BoxPushing head-to-head with the sibling
+RLAC repo: one task (`fancy/BoxPushingRandomInitDense-v0`), four training envs
+stepped per interaction step (4x the environment samples per step, at an
+unchanged 5M-step budget) and a 2x2 critic sweep over `critic_hidden_dim` and
+`critic_num_blocks`, 5 seeds each. Because four envs cover 5M environment steps
+in 1.25M interaction steps, its `iterations` is 250 rather than 1000 and every
+`*_per_interaction_step` is a quarter of the MetaWorld value.
+
+The two MetaWorld SLURM configs differ in how the partition preempts:
 
 | | `metaworld_online.yml` | `metaworld_online_comgpu.yml` |
 |---|---|---|
@@ -179,10 +188,15 @@ What is different from `run_online.py`:
   only and is meant for transfer, not resume.
 - **Environments.** `configs/env/metaworld.yaml` + `scale_rl/envs/metaworld.py`
   add MetaWorld 3.x's 50 ML1 tasks (goal-observable, 39-D observations, 500-step
-  episodes, no early termination).
+  episodes, no early termination). `configs/env/box_pushing.yaml` +
+  `scale_rl/envs/fancy.py` add fancy_gym's BoxPushing (29-D observations, 7-D
+  joint torques, 100-step episodes) -- built without importing `fancy_gym`,
+  whose package `__init__` needs a gymnasium wrapper that 1.0 removed, and with
+  its MuJoCo-2-only model XML rewritten into a cache directory.
 - **Dependencies.** MetaWorld 3.x needs gymnasium >= 1.1 and mujoco 3.3, which
   `deps/requirements.txt` (the paper's pinned stack) cannot provide. Use
-  `deps/requirements_maxwell.txt` for these runs.
+  `deps/requirements_maxwell.txt` for these runs. fancy_gym must be installed
+  with `--no-deps` (it pins `mujoco==2.3.3`); `deps/setup_maxwell.sh` does that.
 
 On resume the environment is re-`reset()` rather than restored to its exact
 mid-episode simulator state, so only the episode that was in flight is lost.

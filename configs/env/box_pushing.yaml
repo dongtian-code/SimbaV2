@@ -1,0 +1,44 @@
+##################################################################################
+# fancy_gym BoxPushing (Franka pushes a box to a target pose)
+##################################################################################
+
+env_type: 'fancy'
+# The id fancy_gym registers. "RandomInit" redraws the box's starting pose every
+# reset on top of the goal pose, i.e. the full task distribution rather than one
+# fixed instance; "Dense" is the shaped reward. scale_rl/envs/fancy.py builds it
+# WITHOUT importing fancy_gym (its package __init__ needs a gymnasium wrapper
+# that 1.0 removed) and rewrites the MuJoCo-2-only bits of its model XML.
+env_name: 'fancy/BoxPushingRandomInitDense-v0'
+num_env_steps: 5_000_000
+
+# BoxPushing DOES terminate early -- `BoxPushingEnvBase.step` reports
+# `terminated` when the box reaches the target and `truncated` when it does not,
+# but only ever on step 100. Every episode is the same fixed length either way,
+# which is the situation `episodic: false` describes (MetaWorld and DMC are set
+# the same way). `episodic` feeds `agent.critic_use_cdq`, so this also leaves
+# clipped double-Q off; flip it to true to turn CDQ back on.
+episodic: false
+
+seed: ${seed}
+# Four envs stepped per interaction step, i.e. 4x the environment samples per
+# step. `num_interaction_steps` in configs/online_rl.yaml is
+# num_env_steps / (num_train_envs * action_repeat), so the 5M-step budget above
+# is unchanged and a run makes 1.25M interaction steps -- which is why the cw2
+# config sets iterations: 250 and scales every *_per_interaction_step by 1/4.
+# The matching RLAC config collects the same 4 samples per step.
+num_train_envs: 4
+# num_eval_episodes must be divisible by num_eval_envs (scale_rl/evaluation.py).
+# Left at 1: evaluation is not where the sampling budget goes, and one env keeps
+# the eval episodes sequential and cheap.
+num_eval_envs: 1
+action_repeat: 1
+# BoxPushing actions are already in [-1, 1], so this rescaling is a no-op; kept
+# for symmetry with the other env configs.
+rescale_action: true
+# BoxPushing's own episode length -- the env ends the episode itself at 100
+# steps, so the TimeLimit wrapper this feeds cuts at exactly the same step.
+# `gamma` in configs/online_rl.yaml is derived from it:
+# (100/5 - 1) / (100/5) = 0.95. NOTE this is NOT RLAC's discount, which is fixed
+# at 0.99 -- on MetaWorld's 500-step episodes the heuristic happened to land on
+# 0.99 too and the two matched; here they do not. Report it with the results.
+max_episode_steps: 100
