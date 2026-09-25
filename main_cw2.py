@@ -16,7 +16,9 @@ behave identically on the cluster:
     just kills the job, so the run has to submit its own replacement: every rep
     packed into the Slurm job checkpoints, they meet at a checkpoint-ready
     barrier, exactly one of them `sbatch`es the original job script again, and
-    then they all exit.
+    then they all exit. A preemption proper (SIGTERM, SIGKILL ~30 s later) skips
+    the fresh checkpoint and resubmits from the last periodic one; only the
+    wall-time USR1 (300 s ahead) writes a new one. See `_handle_preemption`.
 
 cw2 itself has no restore/resume hooks of any kind -- `AbstractIterativeExperiment`
 only calls `save_state()` after every `iterate()`. Everything below (checkpoint
@@ -159,6 +161,8 @@ _SLURM_PREEMPTION_KEYS = (
     'checkpoint_ready_barrier_timeout',
     'checkpoint_ready_barrier_poll_interval',
     'checkpoint_ready_barrier_submit_on_timeout',
+    'checkpoint_ready_barrier_sigterm_timeout',
+    'active_run_lock_wait_seconds',
 )
 
 
@@ -186,6 +190,28 @@ def _slurm_marker_job_id():
     if array_job_id is not None and array_task_id is not None:
         return f'{array_job_id}_{array_task_id}'
     return os.environ.get('SLURM_JOB_ID', 'local')
+
+
+# Variables that describe the submitting *process*, not the job. `sbatch` exports
+# the caller's whole environment by default, and the caller of a cancel-mode
+# resubmission is a rep deep inside a running job:
+#   - WANDB_SERVICE is the port of the wandb-core service this rep started on the
+#     old node. Inherited by the replacement, every rep there tries to attach to
+#     it on the new node and dies in wandb.init with "WandbServiceConnectionError:
+#     Failed to connect to internal service" -- right after restoring its
+#     checkpoint. That is how the 14.Sep MetaWorld comgpu chain broke (jobs
+#     24662699, 24662700, 24665606). wandb's own agent drops it before spawning
+#     runs for the same reason (wandb/wandb_agent.py).
+#   - CUDA_VISIBLE_DEVICES and the EGL device ids pin this rep to one GPU of the
+#     old node; the replacement's scheduler assigns its own.
+_RESUBMIT_ENV_DROP = ('WANDB_SERVICE', 'CUDA_VISIBLE_DEVICES', 'EGL_DEVICE_ID', 'MUJOCO_EGL_DEVICE_ID')
+
+
+def _resubmission_env():
+    env = dict(os.environ)
+    for key in _RESUBMIT_ENV_DROP:
+        env.pop(key, None)
+    return env
 
 
 def _align_egl_device_with_cuda():
@@ -550,22 +576,47 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
             return os.path.join(os.path.dirname(os.path.abspath(save_model_dir)), 'active.lock')
         return None
 
+    @staticmethod
+    def _active_run_lock_wait_seconds(cw_config):
+        """How long a held lock is waited on before this rep is skipped.
+
+        0 (skip at once) outside cancel mode. On a cancel-mode partition the
+        replacement can start on another node while the preempted rep is still
+        inside Slurm's KillWait, and skipping it then would silently drop the run.
+        """
+        default = 120.0 if _get_preemption_mode(cw_config) in _CANCEL_MODES else 0.0
+        return max(float(cw_config.get('active_run_lock_wait_seconds', default)), 0.0)
+
     def _acquire_active_run_lock(self, cw_config):
         lock_path = self._active_run_lock_path(cw_config)
         if lock_path is None:
             return True
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as error:
-            if error.errno not in (errno.EACCES, errno.EAGAIN):
-                os.close(fd)
-                raise
+        wait_seconds = self._active_run_lock_wait_seconds(cw_config)
+        deadline = time.monotonic() + wait_seconds
+        waiting = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN):
+                    os.close(fd)
+                    raise
+            if time.monotonic() < deadline:
+                if not waiting:
+                    print(f'[checkpoint] Active run lock held at {lock_path}; waiting up to {wait_seconds:.0f}s '
+                          'for the previous holder to exit.', flush=True)
+                    waiting = True
+                time.sleep(2.0)
+                continue
             with os.fdopen(fd, 'r') as f:
                 holder = f.read().strip()
             print(f'[checkpoint] Active run lock held at {lock_path}; skipping duplicate run. Holder: {holder}', flush=True)
             return False
+        if waiting:
+            print(f'[checkpoint] Acquired active run lock at {lock_path}.', flush=True)
         metadata = dict(
             pid=os.getpid(),
             hostname=socket.gethostname(),
@@ -610,20 +661,39 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
         print('[preemption] Termination received while quiesced; exiting at the saved checkpoint boundary.', flush=True)
         raise cw_error.ExperimentSurrender()
 
+    def _existing_checkpoint_path(self):
+        """The newest checkpoint this rep knows to be complete on disk, or None."""
+        path = getattr(self, '_last_checkpoint_path', None)
+        return path if path is not None and os.path.isfile(path) else None
+
     def _handle_preemption(self, cw_config):
+        preemption_mode = _get_preemption_mode(cw_config) or 'requeue'
+        cancel_mode = preemption_mode in _CANCEL_MODES
+        # A cancel-mode partition preempts with SIGTERM and follows up with SIGKILL
+        # after Slurm's KillWait -- 30 s on Maxwell, with GraceTime 0 on comgpu.
+        # That does not reliably cover every rep in the job writing a fresh
+        # checkpoint, meeting at the barrier and submitting, and a replacement that
+        # never gets submitted loses every run in the job. So on SIGTERM keep the
+        # last periodic checkpoint (checkpoint writes are atomic, so it is intact)
+        # and go straight to the resubmission. USR1 is the wall-time warning, 300 s
+        # ahead (`signal: B:USR1@300`), which leaves room for a fresh checkpoint.
+        fast = cancel_mode and self._preemption_signal == signal.SIGTERM
         checkpoint_path = None
-        try:
-            checkpoint_path = self._save_checkpoint(cw_config, force=True)
-        except Exception as error:
-            # Keep going: the last good checkpoint is still on disk, and in
-            # cancel mode a replacement job is worth submitting even if this
-            # write failed -- it will resume from the previous checkpoint.
-            print(f'[preemption] Checkpoint save failed: {error}', flush=True)
+        if fast:
+            print('[preemption] SIGTERM on a cancel-mode partition: skipping the forced checkpoint.', flush=True)
+        else:
+            try:
+                checkpoint_path = self._save_checkpoint(cw_config, force=True)
+            except Exception as error:
+                # Keep going: the last good checkpoint is still on disk, and in
+                # cancel mode a replacement job is worth submitting even if this
+                # write failed -- it will resume from the previous checkpoint.
+                print(f'[preemption] Checkpoint save failed: {error}', flush=True)
+        if checkpoint_path is None:
+            checkpoint_path = self._existing_checkpoint_path()
         self._skip_next_save_state = True
 
-        preemption_mode = _get_preemption_mode(cw_config) or 'requeue'
-
-        if preemption_mode in _CANCEL_MODES:
+        if cancel_mode:
             # Slurm will not bring this job back, so announce the checkpoint,
             # wait for the other reps in this job, and submit the replacement.
             # This runs for SIGTERM too: on a cancel-mode partition SIGTERM is
@@ -634,10 +704,18 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
             # published, so this ordering guarantees no rep is still holding its
             # lock when the replacement job starts -- a rep whose lock is still
             # held would be skipped by the replacement and silently lost.
-            # Training is already over at this point; the checkpoint is written.
+            # Training is already over at this point, and the checkpoint the
+            # replacement will read (fresh, or on SIGTERM the last periodic one)
+            # is complete on disk.
             self._release_active_run_lock()
-            self._publish_checkpoint_ready(cw_config, checkpoint_path)
-            self._resubmit_if_cancel_preemption(cw_config)
+            # 'skipped' when nothing is on disk yet: the replacement then starts
+            # this rep from scratch, and the barrier must not wait for a
+            # checkpoint that will never appear.
+            print(f'[preemption] The replacement resumes this run from '
+                  f'{checkpoint_path or "scratch (no checkpoint yet)"}.', flush=True)
+            self._publish_checkpoint_ready(
+                cw_config, checkpoint_path, status='ready' if checkpoint_path else 'skipped')
+            self._resubmit_if_cancel_preemption(cw_config, fast=fast)
             print('[preemption] Cancel-mode handling complete; exiting.', flush=True)
             raise cw_error.ExperimentSurrender({'preempted': True, 'preemption_mode': preemption_mode})
 
@@ -812,7 +890,7 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
             ready.add(self._barrier_task_id(marker.get('task_id')))
         return ready
 
-    def _wait_for_checkpoint_ready_barrier(self, cw_config):
+    def _wait_for_checkpoint_ready_barrier(self, cw_config, fast=False):
         if not self._bool_cfg(cw_config, 'checkpoint_ready_barrier_enabled', True):
             return True
         try:
@@ -821,7 +899,17 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
             print(f'[checkpoint barrier] {error}; not resubmitting.', flush=True)
             return False
 
-        timeout = float(cw_config.get('checkpoint_ready_barrier_timeout', 240.0))
+        if fast:
+            # SIGKILL follows SIGTERM within KillWait (30 s) whatever happens
+            # here, so not submitting after a timeout would lose every rep in the
+            # job. Submitting past a straggler is safe: the straggler writes
+            # nothing (the forced checkpoint is skipped on SIGTERM), and the
+            # replacement waits for its active-run lock instead of skipping it.
+            timeout = float(cw_config.get('checkpoint_ready_barrier_sigterm_timeout', 15.0))
+            submit_on_timeout = True
+        else:
+            timeout = float(cw_config.get('checkpoint_ready_barrier_timeout', 240.0))
+            submit_on_timeout = self._bool_cfg(cw_config, 'checkpoint_ready_barrier_submit_on_timeout', False)
         poll = float(cw_config.get('checkpoint_ready_barrier_poll_interval', 0.5))
         if timeout < 0 or poll <= 0:
             print('[checkpoint barrier] Invalid timeout/poll interval; not resubmitting.', flush=True)
@@ -840,7 +928,7 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
                 last_missing = missing
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                submit_anyway = self._bool_cfg(cw_config, 'checkpoint_ready_barrier_submit_on_timeout', False)
+                submit_anyway = submit_on_timeout
                 print(
                     f'[checkpoint barrier] Timed out after {timeout:.1f}s; missing {missing}; '
                     f'{"submitting anyway" if submit_anyway else "not resubmitting"}.',
@@ -954,13 +1042,13 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
                        'created_at': time.strftime('%Y-%m-%d %H:%M:%S')}, f, sort_keys=True)
         return marker_path
 
-    def _resubmit_if_cancel_preemption(self, cw_config):
+    def _resubmit_if_cancel_preemption(self, cw_config, fast=False):
         if _get_preemption_mode(cw_config) not in _CANCEL_MODES:
             return False
         if self._resubmit_disabled(cw_config):
             print('[preemption] Replacement submission disabled; checkpoint only.', flush=True)
             return False
-        if not self._wait_for_checkpoint_ready_barrier(cw_config):
+        if not self._wait_for_checkpoint_ready_barrier(cw_config, fast=fast):
             print('[preemption] Checkpoint-ready barrier not satisfied; not resubmitting.', flush=True)
             return False
 
@@ -971,7 +1059,7 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
             return False
 
         print(f'[preemption] Submitting replacement job: {command}', flush=True)
-        result = subprocess.run(command, shell=True, cwd=os.getcwd())
+        result = subprocess.run(command, shell=True, cwd=os.getcwd(), env=_resubmission_env())
         with open(marker_path, 'w') as f:
             json.dump({'pid': os.getpid(), 'command': command, 'returncode': result.returncode,
                        'status': 'submitted' if result.returncode == 0 else 'failed',
@@ -1071,6 +1159,10 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
             if self.overwrite_checkpoints:
                 self._prune_checkpoints(self.resume_model_dir, name)
 
+        # What a cancel-mode SIGTERM falls back on: the copy the next job reads.
+        self._last_checkpoint_path = (
+            os.path.join(self.resume_model_dir, name) if self.resume_model_dir is not None else checkpoint_path)
+
         print(
             f'[checkpoint] Saved: {checkpoint_path} '
             f'(n={n}, interaction_step={self.interaction_step}, update_step={self.update_step})',
@@ -1085,6 +1177,7 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
 
         self._skip_next_save_state = False
         self._active_run_lock_fd = None
+        self._last_checkpoint_path = None
         self._preemption_requested = False
         self._preemption_signal = None
         # NOT `self.run`: AbstractIterativeExperiment.run() is the driver that
@@ -1185,6 +1278,7 @@ class SimbaV2Experiment(experiment.AbstractIterativeExperiment):
 
         if resume_checkpoint_path is not None:
             extra = load_checkpoint(resume_checkpoint_path, self.agent, buffer=self.buffer)
+            self._last_checkpoint_path = resume_checkpoint_path
             self.n_completed = int(extra['num_iterations'])
             self.interaction_step = int(extra['interaction_step'])
             self.update_step = int(extra['update_step'])
